@@ -2,9 +2,42 @@ import streamlit as st
 import plotly.graph_objects as go
 import pandas as pd
 from config import CURATED_MF
-from utils.cache import cached_mf_data, cached_fund_meta
+from utils.cache import cached_mf_data, cached_fund_meta, cached_fund_search
 from utils.formatters import format_pct, format_inr
 from data.mutual_funds import fetch_nav_history
+
+
+def _cagr_badge(val) -> str:
+    if val is None:
+        return '<span style="background:#44444422;color:#888;padding:2px 8px;border-radius:12px;font-size:0.8rem;font-weight:600;">N/A</span>'
+    color = ("#00C853" if val >= 15 else "#FFB300" if val >= 10 else "#FF4466")
+    bg = ("#00C85322" if val >= 15 else "#FFB30022" if val >= 10 else "#FF446622")
+    return f'<span style="background:{bg};color:{color};padding:2px 10px;border-radius:12px;font-size:0.82rem;font-weight:700;">{val:.1f}%</span>'
+
+
+def _fund_search_widget(key_prefix: str) -> int | None:
+    """Search box that returns selected scheme code or None. key_prefix keeps widget keys unique."""
+    query = st.text_input(
+        "🔍 Search fund by name",
+        placeholder="e.g. HDFC Midcap, Parag Parikh, Mirae...",
+        key=f"{key_prefix}_search_query",
+    )
+    if query.strip():
+        with st.spinner("Searching..."):
+            try:
+                results = cached_fund_search(query.strip())
+            except Exception:
+                results = []
+        if results:
+            direct_growth = [r for r in results if "direct" in r["schemeName"].lower() and "growth" in r["schemeName"].lower()]
+            show = direct_growth[:10] if direct_growth else results[:10]
+            options = {f"{r['schemeName']} ({r['schemeCode']})": r["schemeCode"] for r in show}
+            chosen = st.selectbox("Select fund", list(options.keys()), key=f"{key_prefix}_search_select")
+            if chosen:
+                return options[chosen]
+        else:
+            st.caption("No funds found. Try a shorter name.")
+    return None
 
 
 def _nav_buttons(active: str):
@@ -75,17 +108,13 @@ def render():
         display = df.copy()
         display["cagr_3yr"] = display["cagr_3yr"].apply(format_pct)
         display["cagr_5yr"] = display["cagr_5yr"].apply(format_pct)
-        display["sharpe_1yr"] = display["sharpe_1yr"].apply(lambda v: f"{v:.2f}" if v else "N/A")
-        display["expense_ratio"] = display["expense_ratio"].apply(lambda v: format_pct(v) if v else "N/A")
         display["latest_nav"] = display["latest_nav"].apply(lambda v: f"₹{v:.2f}" if v else "N/A")
         rename = {
             "fund_name": "Fund Name", "category": "Category",
             "cagr_3yr": "3yr CAGR", "cagr_5yr": "5yr CAGR",
-            "sharpe_1yr": "Sharpe", "latest_nav": "NAV",
-            "expense_ratio": "Exp Ratio", "scheme_code": "Code",
+            "latest_nav": "NAV",
         }
-        # reorder columns: Fund Name first, Code last
-        col_order = [c for c in ["fund_name", "category", "cagr_3yr", "cagr_5yr", "sharpe_1yr", "latest_nav", "expense_ratio", "scheme_code"] if c in display.columns]
+        col_order = [c for c in ["fund_name", "category", "cagr_3yr", "cagr_5yr", "latest_nav"] if c in display.columns]
         st.dataframe(display[col_order].rename(columns=rename), use_container_width=True, height=420)
         st.caption("NAV data: MFAPI.in · Expense ratios approximate · Past performance ≠ future returns")
 
@@ -143,12 +172,12 @@ def render():
   <div style="color:#F5A623;font-size:1rem;font-weight:700;">#{list(top2.index).index(i)+1} — {row['category']}</div>
   <div style="color:#FFFFFF;font-size:0.95rem;font-weight:600;margin:0.2rem 0 0.1rem;">{fname}</div>
   <div style="color:#7B8699;font-size:0.8rem;margin-bottom:0.6rem;">Scheme Code: <b style="color:#FFFFFF">{row['scheme_code']}</b> · Search on Groww/Zerodha to start SIP</div>
-  <div style="display:flex;gap:2rem;flex-wrap:wrap;">
-    <span>📈 <b>5yr CAGR:</b> <span style="color:#F5A623">{format_pct(row['cagr_5yr'])}</span></span>
-    <span>📈 <b>3yr CAGR:</b> <span style="color:#F5A623">{format_pct(row['cagr_3yr'])}</span></span>
-    <span>⚖️ <b>Sharpe:</b> {row['sharpe_1yr']:.2f}</span>
-    <span>💰 <b>NAV:</b> ₹{row['latest_nav']:.2f}</span>
-    <span>🏷️ <b>Exp Ratio:</b> {exp}</span>
+  <div style="display:flex;gap:1.2rem;flex-wrap:wrap;align-items:center;">
+    <span style="color:#7B8699;font-size:0.85rem;">5yr CAGR {_cagr_badge(row.get('cagr_5yr'))}</span>
+    <span style="color:#7B8699;font-size:0.85rem;">3yr CAGR {_cagr_badge(row.get('cagr_3yr'))}</span>
+    <span style="color:#7B8699;font-size:0.85rem;">⚖️ Sharpe <b style="color:#FFFFFF">{row['sharpe_1yr']:.2f}</b></span>
+    <span style="color:#7B8699;font-size:0.85rem;">💰 NAV <b style="color:#FFFFFF">₹{row['latest_nav']:.2f}</b></span>
+    <span style="color:#7B8699;font-size:0.85rem;">🏷️ Fee <b style="color:#FFFFFF">{exp}</b></span>
   </div>
 </div>
 """, unsafe_allow_html=True)
@@ -174,14 +203,23 @@ def render():
         st.markdown("#### How much would your SIP be worth today?")
         st.caption("Simulates actual unit purchases using real historical NAV each month.")
 
+        searched_sip = _fund_search_widget("sip")
         sip_c1, sip_c2, sip_c3 = st.columns(3)
         with sip_c1:
-            sip_scheme = st.number_input("Scheme Code", min_value=1, value=119598, step=1,
-                                         help="Find scheme code in Compare Funds section")
+            sip_scheme = st.number_input(
+                "Scheme Code",
+                min_value=1,
+                value=int(searched_sip) if searched_sip else 119598,
+                step=1,
+                help="Auto-filled when you pick from search above, or type manually",
+            )
         with sip_c2:
             sip_amount = st.number_input("Monthly SIP Amount (₹)", min_value=100, value=1000, step=100)
         with sip_c3:
             sip_start = st.date_input("SIP Start Date", value=pd.Timestamp.now() - pd.DateOffset(years=3))
+
+        stepup_pct = st.slider("Annual Step-Up % (increase SIP each year)", min_value=0, max_value=30, value=0, step=5,
+                               help="0 = flat SIP. 10 = increase by 10% every year (recommended)")
 
         if st.button("📊 Calculate SIP Returns"):
             with st.spinner("Fetching NAV history..."):
@@ -208,12 +246,20 @@ def render():
                     total_units = 0.0
                     total_invested = 0.0
                     latest_nav_val = float(nav.iloc[-1])
+                    current_sip = sip_amount
+                    current_year = None
                     for date, nav_val in monthly.items():
-                        units = sip_amount / nav_val
+                        if current_year is None:
+                            current_year = date.year
+                        elif date.year != current_year and stepup_pct > 0:
+                            current_sip = round(current_sip * (1 + stepup_pct / 100), 2)
+                            current_year = date.year
+                        units = current_sip / nav_val
                         total_units += units
-                        total_invested += sip_amount
+                        total_invested += current_sip
                         records.append({
                             "date": date,
+                            "monthly_sip": current_sip,
                             "total_invested": round(total_invested, 2),
                             "current_value": round(total_units * latest_nav_val, 2),
                         })
@@ -222,6 +268,8 @@ def render():
                         st.warning("Not enough data to simulate.")
                     else:
                         st.markdown(f"**{sip_fund_name}** · Scheme `{sip_scheme}`")
+                        if stepup_pct > 0:
+                            st.caption(f"Step-up {stepup_pct}% yearly · Final monthly SIP: {format_inr(sim_df['monthly_sip'].iloc[-1])}")
                         final_value = sim_df["current_value"].iloc[-1]
                         final_invested = sim_df["total_invested"].iloc[-1]
                         final_pnl = final_value - final_invested
@@ -260,12 +308,18 @@ def render():
     # ══ SECTION 4: Should I Invest? ════════════════════════════════════════
     elif active == "🔍 Should I Invest?":
         st.markdown("#### Get a plain-English verdict on any fund")
-        st.caption("Enter scheme code → app scores returns, risk, and fees → gives YES / NO / MAYBE.")
+        st.caption("Search by fund name or enter scheme code → app scores returns, risk, and fees → gives YES / NO / MAYBE.")
 
+        searched_verdict = _fund_search_widget("verdict")
         v_c1, v_c2 = st.columns(2)
         with v_c1:
-            verdict_code = st.number_input("Scheme Code", min_value=1, value=119598, step=1,
-                                           key="verdict_scheme")
+            verdict_code = st.number_input(
+                "Scheme Code",
+                min_value=1,
+                value=int(searched_verdict) if searched_verdict else 119598,
+                step=1,
+                key="verdict_scheme",
+            )
         with v_c2:
             verdict_monthly = st.number_input("Monthly SIP you plan (₹)", min_value=100, value=1000, step=100,
                                               key="verdict_amount")
@@ -359,11 +413,15 @@ def render():
 """, unsafe_allow_html=True)
 
                 for dimension, (rating, explanation) in scores.items():
+                    dot = rating.split()[0]
+                    pill_color = ("#00C853" if dot == "🟢" else "#FF4466" if dot == "🔴" else "#FFB300" if dot == "🟡" else "#888888")
+                    pill_bg = ("#00C85322" if dot == "🟢" else "#FF446622" if dot == "🔴" else "#FFB30022" if dot == "🟡" else "#88888822")
+                    rating_text = " ".join(rating.split()[1:])
                     st.markdown(f"""
-<div style="background:#141927;border:1px solid #252D42;border-radius:8px;padding:0.7rem 1rem;margin-bottom:0.5rem;display:flex;gap:1rem;align-items:flex-start;">
-  <div style="min-width:160px;font-weight:600;color:#FFFFFF;">{dimension}</div>
-  <div><span style="font-weight:600;">{rating}</span>
-  <span style="color:#7B8699;margin-left:0.5rem;font-size:0.85rem;">{explanation}</span></div>
+<div style="background:#141927;border:1px solid #252D42;border-radius:8px;padding:0.7rem 1rem;margin-bottom:0.5rem;display:flex;gap:1rem;align-items:center;">
+  <div style="min-width:140px;font-weight:600;color:#FFFFFF;font-size:0.88rem;">{dimension}</div>
+  <span style="background:{pill_bg};color:{pill_color};padding:2px 10px;border-radius:12px;font-size:0.8rem;font-weight:700;white-space:nowrap;">{dot} {rating_text}</span>
+  <span style="color:#7B8699;font-size:0.85rem;">{explanation}</span>
 </div>
 """, unsafe_allow_html=True)
 

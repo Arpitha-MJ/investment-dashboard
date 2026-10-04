@@ -3,6 +3,13 @@ import pandas as pd
 from config import MFAPI_ALL_FUNDS_URL, MFAPI_FUND_URL, CURATED_MF, RISK_FREE_RATE, MF_EXPENSE_RATIOS
 
 
+def search_funds_by_name(query: str) -> list[dict]:
+    """Return [{schemeCode, schemeName}] matching query string."""
+    resp = requests.get(f"https://api.mfapi.in/mf/search?q={query}", timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
 def fetch_all_fund_list() -> list[dict]:
     resp = requests.get(MFAPI_ALL_FUNDS_URL, timeout=30)
     resp.raise_for_status()

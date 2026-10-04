@@ -5,10 +5,21 @@ import yfinance as yf
 from config import DEFAULT_WATCHLIST
 from utils.cache import cached_stock_fundamentals
 from data.stocks import filter_stocks
-from utils.formatters import format_crore, format_pct, format_inr
+from data.portfolio import init_db, get_watchlist, add_to_watchlist, remove_from_watchlist
+from utils.formatters import format_pct, format_inr
+
+SECTOR_MAP = {
+    "IT":       ["TCS.NS","INFY.NS","WIPRO.NS","LTIMINDTREE.NS"],
+    "Banking":  ["HDFCBANK.NS","ICICIBANK.NS","SBIN.NS","AXISBANK.NS","KOTAKBANK.NS"],
+    "Auto":     ["MARUTI.NS","TATAMOTORS.NS","BAJAJ-AUTO.NS","HEROMOTOCO.NS"],
+    "FMCG":     ["HINDUNILVR.NS","ITC.NS","NESTLEIND.NS","DABUR.NS"],
+    "Finance":  ["BAJFINANCE.NS","HDFCLIFE.NS","SBILIFE.NS"],
+    "Other":    ["RELIANCE.NS","TITAN.NS","ASIANPAINT.NS","SUNPHARMA.NS","ADANIENT.NS","ULTRACEMCO.NS"],
+}
 
 
 def render():
+    init_db()
     st.markdown('<p class="section-title">Screener · NSE Stocks</p>', unsafe_allow_html=True)
 
     with st.expander("📖 What do these numbers mean?", expanded=False):
@@ -19,12 +30,10 @@ def render():
 | **ROE %** | Return on Equity. How efficiently company uses shareholder money to make profit. Higher = better. | Above 15% is good |
 | **D/E** | Debt ÷ Equity. How much debt the company carries vs its own money. Lower = safer. | Below 1.0 is safe |
 | **Rev Growth** | Revenue Growth %. Is the company growing its sales? Positive = growing. | Above 10% is healthy |
-| **Beta** | How much the stock moves vs the market. Beta 1 = moves same as market. >1 = more volatile. | 0.5–1.2 is stable |
-| **52W High/Low** | Highest and lowest price in last 52 weeks. Helps you see where current price sits. | — |
 | **Mkt Cap** | Total value of the company. Large cap = more stable. | — |
 """)
 
-    with st.expander("🔧 Filters & Add Ticker", expanded=False):
+    with st.expander("🔧 Filters & Watchlist", expanded=False):
         f1, f2 = st.columns(2)
         with f1:
             max_pe = st.slider("Max P/E Ratio", 5, 150, 150)
@@ -32,15 +41,40 @@ def render():
         with f2:
             max_de = st.slider("Max Debt/Equity", 0.0, 10.0, 10.0, step=0.5)
             min_rev_growth = st.slider("Min Revenue Growth %", -50, 50, -50)
-        custom_input = st.text_input("Add ticker", placeholder="TATAMOTORS.NS")
 
+        all_sectors = list(SECTOR_MAP.keys())
+        selected_sectors = st.multiselect("Sector filter", all_sectors, default=all_sectors)
+
+        add_col, rem_col = st.columns(2)
+        with add_col:
+            custom_input = st.text_input("➕ Add ticker to watchlist", placeholder="TATAMOTORS.NS")
+            if st.button("Add", key="add_ticker"):
+                if custom_input.strip():
+                    t = custom_input.strip().upper()
+                    if not t.endswith(".NS") and not t.endswith(".BO"):
+                        t += ".NS"
+                    add_to_watchlist(t)
+                    cached_stock_fundamentals.clear()
+                    st.rerun()
+        with rem_col:
+            remove_input = st.text_input("➖ Remove ticker from watchlist", placeholder="TATAMOTORS.NS")
+            if st.button("Remove", key="remove_ticker"):
+                if remove_input.strip():
+                    remove_from_watchlist(remove_input.strip().upper())
+                    cached_stock_fundamentals.clear()
+                    st.rerun()
+
+    saved_tickers = get_watchlist()
     watchlist = list(DEFAULT_WATCHLIST)
-    if custom_input.strip():
-        ticker = custom_input.strip().upper()
-        if not ticker.endswith(".NS") and not ticker.endswith(".BO"):
-            ticker += ".NS"
-        if ticker not in watchlist:
-            watchlist.append(ticker)
+    for t in saved_tickers:
+        if t not in watchlist:
+            watchlist.append(t)
+
+    if selected_sectors and selected_sectors != all_sectors:
+        sector_tickers = []
+        for s in selected_sectors:
+            sector_tickers.extend(SECTOR_MAP.get(s, []))
+        watchlist = [t for t in watchlist if t in sector_tickers] or watchlist
 
     with st.spinner("Fetching fundamentals from Yahoo Finance..."):
         df = cached_stock_fundamentals(tuple(watchlist))
@@ -98,25 +132,25 @@ def render():
 
     display = filtered.copy()
     display["signal"] = filtered.apply(_stock_signal, axis=1)
-    display["market_cap"] = display["market_cap"].apply(format_crore)
     display["price"] = display["price"].apply(format_inr)
     display["pe_ratio"] = display["pe_ratio"].apply(lambda v: f"{v:.1f}" if v and not pd.isna(v) else "N/A")
     display["roe_pct"] = display["roe_pct"].apply(format_pct)
     display["revenue_growth_pct"] = display["revenue_growth_pct"].apply(format_pct)
-    display["dividend_yield"] = display["dividend_yield"].apply(lambda v: format_pct(v or 0))
-    display["debt_to_equity"] = display["debt_to_equity"].apply(lambda v: f"{v:.1f}" if v and not pd.isna(v) else "N/A")
 
     rename = {
-        "signal": "Signal", "name": "Company", "ticker": "Ticker", "price": "Price",
-        "pe_ratio": "P/E", "roe_pct": "ROE %",
-        "revenue_growth_pct": "Rev Growth", "market_cap": "Mkt Cap",
-        "dividend_yield": "Div Yield", "debt_to_equity": "Debt/Eq",
+        "signal": "Signal", "name": "Company", "ticker": "Ticker",
+        "price": "Price", "pe_ratio": "P/E", "roe_pct": "ROE %",
+        "revenue_growth_pct": "Rev Growth",
     }
-    cols_show = [c for c in ["signal", "name", "ticker", "price", "pe_ratio", "roe_pct", "revenue_growth_pct", "market_cap", "dividend_yield", "debt_to_equity"] if c in display.columns]
-    st.dataframe(
-        display[cols_show].rename(columns=rename).reset_index(drop=True),
-        use_container_width=True, height=400,
-        hide_index=True,
+    cols_show = [c for c in ["signal", "name", "ticker", "price", "pe_ratio", "roe_pct", "revenue_growth_pct"] if c in display.columns]
+    final_table = display[cols_show].rename(columns=rename).reset_index(drop=True)
+    st.dataframe(final_table, use_container_width=True, height=400, hide_index=True)
+
+    st.download_button(
+        "⬇️ Export to CSV",
+        data=final_table.to_csv(index=False).encode("utf-8"),
+        file_name="stocks_screener.csv",
+        mime="text/csv",
     )
 
     chart_df = filtered.dropna(subset=["roe_pct"]).head(10)

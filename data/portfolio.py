@@ -24,6 +24,29 @@ def init_db():
                 created_at  TEXT DEFAULT (datetime('now'))
             )
         """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS watchlist (
+                ticker TEXT PRIMARY KEY
+            )
+        """)
+        con.commit()
+
+
+def get_watchlist() -> list[str]:
+    with _conn() as con:
+        rows = con.execute("SELECT ticker FROM watchlist ORDER BY ticker").fetchall()
+    return [r[0] for r in rows]
+
+
+def add_to_watchlist(ticker: str):
+    with _conn() as con:
+        con.execute("INSERT OR IGNORE INTO watchlist (ticker) VALUES (?)", (ticker.upper(),))
+        con.commit()
+
+
+def remove_from_watchlist(ticker: str):
+    with _conn() as con:
+        con.execute("DELETE FROM watchlist WHERE ticker = ?", (ticker.upper(),))
         con.commit()
 
 

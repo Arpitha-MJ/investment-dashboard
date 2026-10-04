@@ -1,9 +1,10 @@
 import streamlit as st
 import plotly.graph_objects as go
 import pandas as pd
-from data.portfolio import init_db, add_holding, get_all_holdings, delete_holding, compute_portfolio_value
+from data.portfolio import init_db, add_holding, get_all_holdings, delete_holding, update_holding, compute_portfolio_value
 from utils.cache import cached_eod_prices, cached_mf_nav_bulk
 from utils.formatters import format_inr, format_pct
+from datetime import datetime
 
 
 def _compute_mf_value(holdings_df: pd.DataFrame, mf_navs: dict) -> pd.DataFrame:
@@ -112,6 +113,36 @@ def render():
 
     portfolio = pd.concat([stock_portfolio, mf_portfolio], ignore_index=True) if not stock_portfolio.empty or not mf_portfolio.empty else holdings.copy()
 
+    # ── XIRR ──────────────────────────────────────────────────────────────────
+    def _compute_xirr(pf: pd.DataFrame) -> float | None:
+        try:
+            from scipy.optimize import brentq
+            cashflows = []
+            for _, row in pf.iterrows():
+                try:
+                    d = datetime.strptime(str(row.get("buy_date", "")), "%Y-%m-%d")
+                    cashflows.append((d, -float(row["invested_value"])))
+                except Exception:
+                    pass
+            if not cashflows:
+                return None
+            today = datetime.now()
+            total_current_val = pf["current_value"].dropna().sum()
+            cashflows.append((today, total_current_val))
+            dates = [c[0] for c in cashflows]
+            amounts = [c[1] for c in cashflows]
+            t0 = dates[0]
+            years = [(d - t0).days / 365.0 for d in dates]
+
+            def npv(rate):
+                return sum(a / (1 + rate) ** t for a, t in zip(amounts, years))
+
+            return round(brentq(npv, -0.999, 100.0) * 100, 2)
+        except Exception:
+            return None
+
+    xirr_val = _compute_xirr(portfolio) if "invested_value" in portfolio.columns and "current_value" in portfolio.columns else None
+
     # ── SUMMARY CARD ───────────────────────────────────────────────────────
     total_invested = portfolio["invested_value"].sum() if "invested_value" in portfolio.columns else 0
     total_current = portfolio["current_value"].dropna().sum() if "current_value" in portfolio.columns else 0
@@ -151,15 +182,16 @@ def render():
 """, unsafe_allow_html=True)
 
     # ── KPI row ────────────────────────────────────────────────────────────
-    k1, k2, k3, k4 = st.columns(4)
+    k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("Total Invested", format_inr(total_invested))
     k2.metric("Current Value", format_inr(total_current))
     k3.metric("Total P&L", format_inr(total_pnl), delta=f"{pnl_sign}{total_pnl_pct:.1f}%")
+    k4.metric("XIRR", f"{xirr_val:.1f}%" if xirr_val is not None else "—", help="Annualised return accounting for timing of each investment")
 
     valid_pnl = portfolio.dropna(subset=["pnl_pct"]) if "pnl_pct" in portfolio.columns else pd.DataFrame()
     if not valid_pnl.empty:
         best = valid_pnl.loc[valid_pnl["pnl_pct"].idxmax()]
-        k4.metric("Best Performer", best["ticker"], delta=format_pct(best["pnl_pct"]))
+        k5.metric("Best Performer", best["ticker"], delta=format_pct(best["pnl_pct"]))
 
     st.markdown("---")
 
@@ -168,8 +200,19 @@ def render():
     with col_left:
         st.markdown("**Holdings**")
         display_cols = ["id", "ticker", "asset_type", "quantity", "buy_price",
-                        "current_price", "invested_value", "current_value", "pnl", "pnl_pct", "buy_date"]
+                        "current_price", "invested_value", "current_value", "pnl", "pnl_pct", "buy_date", "notes"]
         display = portfolio[[c for c in display_cols if c in portfolio.columns]].copy()
+
+        if "buy_date" in display.columns:
+            def _duration(d):
+                try:
+                    delta = (datetime.now() - datetime.strptime(str(d), "%Y-%m-%d")).days
+                    if delta >= 365:
+                        return f"{delta // 365}y {(delta % 365) // 30}m"
+                    return f"{delta // 30}m {delta % 30}d"
+                except Exception:
+                    return "—"
+            display["held_for"] = display["buy_date"].apply(_duration)
 
         if "buy_price" in display.columns:
             display["buy_price"] = display["buy_price"].apply(format_inr)
@@ -189,10 +232,17 @@ def render():
             "quantity": "Qty", "buy_price": "Buy ₹",
             "current_price": "Current ₹", "invested_value": "Invested",
             "current_value": "Value", "pnl": "P&L", "pnl_pct": "P&L%",
-            "buy_date": "Date",
+            "buy_date": "Date", "held_for": "Held For", "notes": "Notes",
         }
-        st.dataframe(display.rename(columns={k: v for k, v in rename.items() if k in display.columns}),
-                     use_container_width=True)
+        final_portfolio_table = display.rename(columns={k: v for k, v in rename.items() if k in display.columns})
+        st.dataframe(final_portfolio_table, use_container_width=True)
+
+        st.download_button(
+            "⬇️ Export Portfolio CSV",
+            data=final_portfolio_table.to_csv(index=False).encode("utf-8"),
+            file_name="my_portfolio.csv",
+            mime="text/csv",
+        )
 
         delete_id = st.number_input("Delete holding by ID", min_value=0, value=0, step=1)
         if st.button("🗑 Delete"):
@@ -203,6 +253,40 @@ def render():
                 st.rerun()
             else:
                 st.warning("Enter a valid holding ID.")
+
+        with st.expander("✏️ Edit Holding", expanded=False):
+            with st.form("edit_holding_form"):
+                e1, e2, e3 = st.columns(3)
+                with e1:
+                    edit_id = st.number_input("Holding ID to edit", min_value=1, value=1, step=1)
+                    edit_ticker = st.text_input("New Ticker / Code (leave blank to keep)")
+                with e2:
+                    edit_price = st.number_input("New Buy Price (0 = keep)", min_value=0.0, value=0.0, step=0.01)
+                    edit_qty = st.number_input("New Quantity (0 = keep)", min_value=0.0, value=0.0, step=0.001)
+                with e3:
+                    edit_date = st.text_input("New Buy Date (YYYY-MM-DD, blank = keep)")
+                    edit_notes = st.text_input("New Notes (blank = keep)")
+                edit_submitted = st.form_submit_button("✏️ Update Holding")
+                if edit_submitted:
+                    updates = {}
+                    if edit_ticker.strip():
+                        updates["ticker"] = edit_ticker.strip().upper()
+                    if edit_price > 0:
+                        updates["buy_price"] = edit_price
+                    if edit_qty > 0:
+                        updates["quantity"] = edit_qty
+                    if edit_date.strip():
+                        updates["buy_date"] = edit_date.strip()
+                    if edit_notes.strip():
+                        updates["notes"] = edit_notes.strip()
+                    if updates:
+                        update_holding(int(edit_id), **updates)
+                        cached_eod_prices.clear()
+                        cached_mf_nav_bulk.clear()
+                        st.success(f"Updated holding #{edit_id}")
+                        st.rerun()
+                    else:
+                        st.warning("No changes entered.")
 
     with col_right:
         valid_current = portfolio.dropna(subset=["current_value"]) if "current_value" in portfolio.columns else pd.DataFrame()
@@ -236,3 +320,4 @@ def render():
         cached_eod_prices.clear()
         cached_mf_nav_bulk.clear()
         st.rerun()
+    st.caption(f"Prices last fetched: {datetime.now().strftime('%d %b %Y %H:%M')} · Stocks: NSE via Yahoo Finance · MF: MFAPI.in")
