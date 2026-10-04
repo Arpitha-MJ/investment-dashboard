@@ -2,6 +2,7 @@
 MarketMate Telegram Bot
 Commands:
   /portfolio  — current P&L summary
+  /sip        — all MF/SIP holdings with live NAV P&L
   /stocks     — top BUY signals from watchlist
   /ipo        — IPOs with positive GMP
   /alert add RELIANCE.NS below 2800  — set price alert
@@ -167,7 +168,8 @@ def _build_portfolio_summary() -> str:
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "📈 *MarketMate Bot Commands*\n\n"
-        "/portfolio — current P&L summary\n"
+        "/portfolio — stocks P&L summary\n"
+        "/sip — MF/SIP holdings with live NAV P&L\n"
         "/stocks — BUY signals from watchlist\n"
         "/ipo — IPOs with positive GMP\n"
         "/alert add RELIANCE.NS below 2800\n"
@@ -182,6 +184,83 @@ async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Fetching portfolio...", parse_mode="Markdown")
     msg = _build_portfolio_summary()
     await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def cmd_sip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Fetching MF NAV data...", parse_mode="Markdown")
+    holdings = get_all_holdings()
+    mf_h = holdings[holdings["asset_type"] == "MF"] if not holdings.empty else pd.DataFrame()
+
+    if mf_h.empty:
+        await update.message.reply_text("No MF/SIP holdings found. Add them via dashboard.")
+        return
+
+    # fetch live NAVs
+    mf_codes = []
+    for t in mf_h["ticker"].tolist():
+        try:
+            mf_codes.append(int(t))
+        except (ValueError, TypeError):
+            pass
+
+    navs = {}
+    if mf_codes:
+        try:
+            from utils.cache import cached_mf_nav_bulk
+            navs = cached_mf_nav_bulk(tuple(mf_codes))
+        except Exception:
+            pass
+
+    lines = [f"💰 *SIP / Mutual Fund Holdings* — {datetime.now().strftime('%d %b %Y')}\n"]
+    total_inv = 0.0
+    total_cur = 0.0
+
+    for _, row in mf_h.iterrows():
+        ticker   = str(row["ticker"])
+        units    = float(row["quantity"])
+        buy_nav  = float(row["buy_price"])
+        invested = buy_nav * units
+        total_inv += invested
+
+        try:
+            code = int(ticker)
+            live_nav = navs.get(code)
+        except (ValueError, TypeError):
+            live_nav = None
+
+        if live_nav:
+            current  = live_nav * units
+            pnl      = current - invested
+            pnl_pct  = (pnl / invested * 100) if invested else 0
+            total_cur += current
+            emoji = "🟢" if pnl >= 0 else "🔴"
+            sign  = "+" if pnl >= 0 else ""
+            lines.append(
+                f"{emoji} *Scheme {ticker}*\n"
+                f"   Units: {units:.3f}  Buy NAV: ₹{buy_nav:.2f}  Live NAV: ₹{live_nav:.2f}\n"
+                f"   Invested: {_fmt_inr(invested)}  Current: {_fmt_inr(current)}\n"
+                f"   P&L: {sign}{_fmt_inr(pnl)} ({sign}{pnl_pct:.1f}%)\n"
+            )
+        else:
+            total_cur += invested  # fallback
+            lines.append(
+                f"⚪ *Scheme {ticker}*\n"
+                f"   Units: {units:.3f}  Buy NAV: ₹{buy_nav:.2f}  Live NAV: unavailable\n"
+                f"   Invested: {_fmt_inr(invested)}\n"
+            )
+
+    overall_pnl = total_cur - total_inv
+    overall_pct = (overall_pnl / total_inv * 100) if total_inv else 0
+    sign  = "+" if overall_pnl >= 0 else ""
+    emoji = "🟢" if overall_pnl >= 0 else "🔴"
+    lines.append(
+        f"\n{emoji} *Total MF*\n"
+        f"   Invested : {_fmt_inr(total_inv)}\n"
+        f"   Current  : {_fmt_inr(total_cur)}\n"
+        f"   P&L      : {sign}{_fmt_inr(overall_pnl)} ({sign}{overall_pct:.1f}%)"
+    )
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def cmd_stocks(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -370,6 +449,7 @@ def main():
     app.add_handler(CommandHandler("help",      cmd_help))
     app.add_handler(CommandHandler("start",     cmd_help))
     app.add_handler(CommandHandler("portfolio", cmd_portfolio))
+    app.add_handler(CommandHandler("sip",       cmd_sip))
     app.add_handler(CommandHandler("stocks",    cmd_stocks))
     app.add_handler(CommandHandler("ipo",       cmd_ipo))
     app.add_handler(CommandHandler("alert",     cmd_alert))
